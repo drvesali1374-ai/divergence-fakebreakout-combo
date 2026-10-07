@@ -1,0 +1,611 @@
+//@version=6
+// =====================================================================
+//  Multi-Oscillator Divergence & Confluence Strategy  (Pine Script v6)
+//  Spec source of truth: /home/z/my-project/TRADING_STRATEGY_SPEC.md
+// =====================================================================
+//  Signal types (6 total):
+//    At swing LOWS  (bullish family):
+//      RBD  Regular Bullish Divergence  (reversal)     — price LL , osc HL
+//      HBD  Hidden  Bullish Divergence  (continuation) — price HL , osc LL
+//      BC   Bullish Convergence         (continuation) — price HL , osc HL
+//    At swing HIGHS (bearish family):
+//      RTD  Regular Bearish Divergence (reversal)      — price HH , osc LH
+//      HTD  Hidden  Bearish Divergence  (continuation) — price LH , osc HH
+//      BCv  Bearish Convergence         (continuation) — price LH , osc LH
+//
+//  NO-LOOKAHEAD GUARANTEE:
+//    A price pivot is confirmed at bar t only if R bars have closed past it.
+//    Implementation: ta.highestbars(high, L) == -R  →  pivot bar = t-R.
+//    Oscillator values are read at [R]  (i.e., at the pivot bar t-R, already
+//    known with certainty at bar t).  Signals fire on barstate.isconfirmed
+//    (i.e., on candle close).  No request.security, no lookahead=on.
+//    Pivots are defined on PRICE only — shared across all 10 oscillators.
+//
+//  Confluence:
+//    At each new confirmed price pivot, every enabled oscillator votes for
+//    one of the 3 classes on that side. Pick the highest-vote class (tie-break
+//    reversal > hidden > convergence). Density bonus (+densityBonus) if the
+//    SAME class also won the previous pivot (back-to-back). Require
+//    minStrength (with bonus applied) and minVotes.
+//
+//  Structural Filters (causal, no lookahead):
+//    minPivotBars — minimum bars between two consecutive pivots; closer pairs
+//      are skipped entirely to suppress noisy oscillations.
+//      حداقل فاصله بین دو پیوت متوالی — جفت‌های نزدیک فیلتر می‌شوند.
+//    minDivRatio  — minimum ratio of divergence magnitude (|osc_last−osc_prev|)
+//      to the oscillator's range over [bar_prev..bar_last]; weaker divergences
+//      are suppressed per-oscillator.
+//      حداقل نسبت قدرت واگرایی به محدوده اوسیلاتور — واگرایی‌های ضعیف فیلتر می‌شوند.
+//
+//  Confirmations (all toggleable):
+//    useTrendFilter   — EMA200 (reversal=against-trend, continuation=with-trend)
+//    useRSIExtreme    — RBD needs RSI<45, RTD needs RSI>55 (others exempt)
+//    useVolumeSpike   — signal-bar volume > 1.3 × SMA(volume,20)
+//    useCandleConfirm — engulfing / hammer / shooting star
+//
+//  Risk:  ATR(14) SL/TP, optional trailing, maxHoldBars exit, opposite-signal
+//  exit, optional reversal. One position at a time (pyramiding=0).
+// =====================================================================
+
+strategy("Oscillator Confluence Divergence Strategy",
+     overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.1,
+     slippage=1,
+     pyramiding=0,
+     max_bars_back=5000)
+
+// ===================================================================
+// 1. INPUTS — PIVOT / SWING DETECTION (CAUSAL)
+// ===================================================================
+grp_pivot = "📐 Pivot / Swing (Causal, No-Lookahead)"
+pivotLeft     = input.int(10, "Lookback Window (L)", minval=3, group=grp_pivot,
+     tooltip="تعداد کل کندل‌ها برای تست بودنِ یک کندل به‌عنوان پیوت (L)")
+pivotRight_in = input.int(3, "Confirmation Bars (R)", minval=1, group=grp_pivot,
+     tooltip="تعداد کندل‌هایی که بعد از پیوت باید بگذرد تا تأیید شود (تأخیر ذاتی، بدون آینده‌نگری)")
+pivotRight    = math.min(pivotRight_in, pivotLeft - 1)
+
+// ===================================================================
+// 2. INPUTS — OSCILLATORS (10, EACH TOGGLEABLE)
+// ===================================================================
+grp_osc = "🎯 Oscillators (Confluence Voters)"
+use_rsi      = input.bool(true, "Enable RSI",                group=grp_osc)
+use_macd     = input.bool(true, "Enable MACD Line",          group=grp_osc)
+use_macdHist = input.bool(true, "Enable MACD Histogram",     group=grp_osc)
+use_stoch    = input.bool(true, "Enable Stochastic %K",     group=grp_osc)
+use_cci      = input.bool(true, "Enable CCI",                group=grp_osc)
+use_mfi      = input.bool(true, "Enable MFI",                group=grp_osc)
+use_obvROC   = input.bool(true, "Enable OBV-ROC",            group=grp_osc)
+use_momROC   = input.bool(true, "Enable ROC / Momentum",     group=grp_osc)
+use_ao       = input.bool(true, "Enable Awesome Oscillator", group=grp_osc)
+use_willR    = input.bool(true, "Enable Williams %R",        group=grp_osc)
+
+grp_len = "🎯 Oscillator Lengths"
+rsi_len         = input.int(14, "RSI Length",          group=grp_len)
+macd_fast       = input.int(12, "MACD Fast",           group=grp_len)
+macd_slow       = input.int(26, "MACD Slow",           group=grp_len)
+macd_signal_len = input.int(9,  "MACD Signal",         group=grp_len)
+stoch_len       = input.int(14, "Stochastic %K",        group=grp_len)
+stoch_smooth    = input.int(3,  "Stochastic Smooth",   group=grp_len)
+cci_len         = input.int(20, "CCI Length",           group=grp_len)
+mfi_len         = input.int(14, "MFI Length",           group=grp_len)
+obvRoc_len      = input.int(14, "OBV-ROC Length",       group=grp_len)
+momRoc_len      = input.int(10, "Momentum ROC Length",  group=grp_len)
+ao_fast         = input.int(5,  "AO Fast",              group=grp_len)
+ao_slow         = input.int(34, "AO Slow",              group=grp_len)
+willR_len       = input.int(14, "Williams %R Length",   group=grp_len)
+
+// ===================================================================
+// 3. INPUTS — CONFLUENCE SCORING
+// ===================================================================
+grp_conf = "🧮 Confluence Scoring"
+minStrength  = input.float(0.5, "Min Strength (0..1)", minval=0.0, maxval=1.0, step=0.05, group=grp_conf,
+     tooltip="حداقل نسبت votes/totalEnabled برای کلاس برتر (با احتساب Density Bonus)")
+minVotes     = input.int(4,    "Min Votes", minval=1, maxval=10, group=grp_conf,
+     tooltip="حداقل تعداد اسیلاتورهای هم‌نظر در کلاس برتر")
+densityBonus = input.float(0.10, "Density Bonus (back-to-back)", minval=0.0, maxval=1.0, step=0.05, group=grp_conf,
+     tooltip="افزایش strength اگر همان کلاس در پیوت قبلی هم پیروز شده بود (تکرار = تحکیم الگو)")
+
+// Structural filters — tuned config (causal, no lookahead)
+// فیلترهای ساختاری: فقط روی پیوت‌های گذشته تأییدشده اعمال می‌شوند.
+minPivotBars = input.int(8, "Min Bars Between Pivots", minval=0, group=grp_conf,
+     tooltip="حداقل فاصله بین دو پیوت متوالی — پیوت‌های خیلی نزدیک نادیده گرفته می‌شوند")
+minDivRatio  = input.float(0.20, "Min Divergence Magnitude (ratio)", minval=0.0, step=0.05, group=grp_conf,
+     tooltip="حداقل نسبت قدرت واگرایی به محدوده اوسیلاتور بین دو پیوت — واگرایی‌های ضعیف فیلتر می‌شوند")
+magLookback  = input.int(50, "Magnitude Lookback (bars)", minval=10, group=grp_conf,
+     tooltip="پنجره ثابت برای محاسبه محدوده اخیر اوسیلاتور در فیلتر قدرت واگرایی (منتهی به پیوت)")
+
+// ===================================================================
+// 4. INPUTS — CONFIRMATIONS
+// ===================================================================
+grp_cfm = "✅ Confirmations"
+useTrendFilter   = input.bool(true,  "Use Trend Filter (EMA)",   group=grp_cfm)
+trendEmaLen      = input.int(200,   "Trend EMA Length",          group=grp_cfm)
+useRSIExtreme    = input.bool(true,  "Use RSI Extreme Filter",   group=grp_cfm,
+     tooltip="RBD نیازمند RSI<45، RTD نیازمند RSI>55؛ HBD/BC/HTD/BCv معاف هستند")
+rsiBullMax       = input.float(42,   "RSI Bull Max (for RBD)",   group=grp_cfm)
+rsiBearMin       = input.float(58,   "RSI Bear Min (for RTD)",   group=grp_cfm)
+useVolumeSpike   = input.bool(true,  "Use Volume Spike",          group=grp_cfm)
+volMult          = input.float(1.3,  "Volume Spike Multiplier",  group=grp_cfm)
+useCandleConfirm = input.bool(true,  "Use Candle Confirm",       group=grp_cfm)
+
+// ===================================================================
+// 5. INPUTS — RISK MANAGEMENT
+// ===================================================================
+grp_risk = "🛡️ Risk Management"
+atrLen        = input.int(14,   "ATR Length",                 group=grp_risk)
+slMult        = input.float(1.2, "SL Multiplier (×ATR)",      group=grp_risk)
+tpMult        = input.float(4.0, "TP Multiplier (×ATR)",      group=grp_risk)
+useTrailing   = input.bool(true,  "Use Trailing Stop",          group=grp_risk)
+trailMult     = input.float(2.5, "Trail Multiplier (×ATR)",    group=grp_risk)
+maxHoldBars   = input.int(50,   "Max Hold Bars", minval=1,       group=grp_risk)
+allowReversal = input.bool(false, "Allow Reversal (opposite flip)", group=grp_risk)
+
+// ===================================================================
+// 6. INPUTS — COOLDOWN & TIMING
+// ===================================================================
+grp_time = "⏱️ Timing"
+cooldown    = input.int(8, "Cooldown Bars (same-side)", minval=0, group=grp_time)
+signal_mode = input.string("On Candle Close", "Signal Timing",
+     options=["On Candle Close", "Intrabar"], group=grp_time,
+     tooltip="On Candle Close = فقط روی کندل بسته‌شده (تضمین عدم آینده‌نگری)")
+
+is_confirmed = signal_mode == "On Candle Close" ? barstate.isconfirmed : true
+
+// ===================================================================
+// 7. OSCILLATOR COMPUTATIONS (GLOBAL SERIES — NO LOOKAHEAD)
+// ===================================================================
+// Each osc is a regular series; values at [pivotRight] are the pivot-bar
+// values at t-R, which are fully known at bar t (already closed).
+osc0 = ta.rsi(close, rsi_len)                                                      // 1. RSI
+[macdLine, signalLine, histLine] = ta.macd(close, macd_fast, macd_slow, macd_signal_len)
+osc1 = macdLine                                                                    // 2. MACD line
+osc2 = histLine                                                                    // 3. MACD histogram
+stoch_raw = ta.stoch(close, high, low, stoch_len)                                  // 0..100
+osc3 = ta.sma(stoch_raw, stoch_smooth)                                             // 4. Stochastic %K (smoothed)
+osc4 = ta.cci(close, cci_len)                                                      // 5. CCI
+osc5 = ta.mfi(hlc3, mfi_len)                                                       // 6. MFI
+osc6 = ta.roc(ta.obv, obvRoc_len)                                                  // 7. OBV-ROC
+osc7 = ta.roc(close, momRoc_len)                                                   // 8. ROC/Momentum
+osc8 = ta.sma(hlc3, ao_fast) - ta.sma(hlc3, ao_slow)                              // 9. Awesome Oscillator
+_hh = ta.highest(high, willR_len)
+_ll = ta.lowest(low,  willR_len)
+osc9 = -100 * (_hh - close) / (_hh - _ll)                                          // 10. Williams %R
+
+// EMA200 trend line & ATR
+emaTrend = ta.ema(close, trendEmaLen)
+atrValue = ta.atr(atrLen)
+plot(emaTrend, "EMA200 Trend", color=color.blue, linewidth=1)
+
+// Total enabled oscillators (constant after inputs)
+totalEnabled = (use_rsi ? 1 : 0) + (use_macd ? 1 : 0) + (use_macdHist ? 1 : 0)
+     + (use_stoch ? 1 : 0) + (use_cci ? 1 : 0) + (use_mfi ? 1 : 0)
+     + (use_obvROC ? 1 : 0) + (use_momROC ? 1 : 0) + (use_ao ? 1 : 0)
+     + (use_willR ? 1 : 0)
+
+// ===================================================================
+// 7b. PRE-COMPUTED OSCILLATOR VALUES AT PIVOT BAR + MAGNITUDE RANGE
+// (unconditional, every bar — no history operator in conditionals)
+// ===================================================================
+// At confirmation bar t, the pivot bar is t-pivotRight. We pre-compute each
+// oscillator's value at [pivotRight] and its recent high/low range ending at
+// the pivot bar, so the conditional swing-detection blocks can read from
+// arrays. This avoids:
+//   - "should be called on each calculation" consistency warnings
+//   - "historical offset beyond buffer limit" runtime errors
+// All offsets used here (pivotRight, magLookback) are small fixed inputs.
+var float[] cur_osc    = array.new_float(10)   // osc value at pivot bar
+var float[] cur_mag_hi = array.new_float(10)   // ta.highest(osc, magLookback) at pivot bar
+var float[] cur_mag_lo = array.new_float(10)   // ta.lowest (osc, magLookback) at pivot bar
+
+array.set(cur_osc, 0, osc0[pivotRight])
+array.set(cur_osc, 1, osc1[pivotRight])
+array.set(cur_osc, 2, osc2[pivotRight])
+array.set(cur_osc, 3, osc3[pivotRight])
+array.set(cur_osc, 4, osc4[pivotRight])
+array.set(cur_osc, 5, osc5[pivotRight])
+array.set(cur_osc, 6, osc6[pivotRight])
+array.set(cur_osc, 7, osc7[pivotRight])
+array.set(cur_osc, 8, osc8[pivotRight])
+array.set(cur_osc, 9, osc9[pivotRight])
+
+array.set(cur_mag_hi, 0, ta.highest(osc0, magLookback)[pivotRight])
+array.set(cur_mag_hi, 1, ta.highest(osc1, magLookback)[pivotRight])
+array.set(cur_mag_hi, 2, ta.highest(osc2, magLookback)[pivotRight])
+array.set(cur_mag_hi, 3, ta.highest(osc3, magLookback)[pivotRight])
+array.set(cur_mag_hi, 4, ta.highest(osc4, magLookback)[pivotRight])
+array.set(cur_mag_hi, 5, ta.highest(osc5, magLookback)[pivotRight])
+array.set(cur_mag_hi, 6, ta.highest(osc6, magLookback)[pivotRight])
+array.set(cur_mag_hi, 7, ta.highest(osc7, magLookback)[pivotRight])
+array.set(cur_mag_hi, 8, ta.highest(osc8, magLookback)[pivotRight])
+array.set(cur_mag_hi, 9, ta.highest(osc9, magLookback)[pivotRight])
+
+array.set(cur_mag_lo, 0, ta.lowest(osc0, magLookback)[pivotRight])
+array.set(cur_mag_lo, 1, ta.lowest(osc1, magLookback)[pivotRight])
+array.set(cur_mag_lo, 2, ta.lowest(osc2, magLookback)[pivotRight])
+array.set(cur_mag_lo, 3, ta.lowest(osc3, magLookback)[pivotRight])
+array.set(cur_mag_lo, 4, ta.lowest(osc4, magLookback)[pivotRight])
+array.set(cur_mag_lo, 5, ta.lowest(osc5, magLookback)[pivotRight])
+array.set(cur_mag_lo, 6, ta.lowest(osc6, magLookback)[pivotRight])
+array.set(cur_mag_lo, 7, ta.lowest(osc7, magLookback)[pivotRight])
+array.set(cur_mag_lo, 8, ta.lowest(osc8, magLookback)[pivotRight])
+array.set(cur_mag_lo, 9, ta.lowest(osc9, magLookback)[pivotRight])
+
+// ===================================================================
+// 8. HELPER FUNCTIONS
+// ===================================================================
+// Is oscillator idx enabled?  (idx: 0..9)
+is_en(int idx) =>
+    bool e = false
+    if idx == 0
+        e := use_rsi
+    else if idx == 1
+        e := use_macd
+    else if idx == 2
+        e := use_macdHist
+    else if idx == 3
+        e := use_stoch
+    else if idx == 4
+        e := use_cci
+    else if idx == 5
+        e := use_mfi
+    else if idx == 6
+        e := use_obvROC
+    else if idx == 7
+        e := use_momROC
+    else if idx == 8
+        e := use_ao
+    else if idx == 9
+        e := use_willR
+    e
+
+// NOTE: get_osc_lag() was removed. Reads of oscillator values at past bars
+// are now done UNCONDITIONALLY at top level (see section 7b) into arrays,
+// then read from arrays inside conditional swing-detection blocks. This:
+//   (1) eliminates Pine's "should be called on each calculation" consistency
+//       warnings that occur when a history-using function is called in a
+//       conditional scope, and
+//   (2) avoids "historical offset beyond buffer limit" runtime errors,
+//       because we only ever use small fixed offsets (pivotRight) at top level.
+
+// ===================================================================
+// 9. STATE VARIABLES (PERSISTENT)
+// ===================================================================
+// Shared price pivots
+var float price_prev_high = na
+var float price_last_high = na
+var int   bar_prev_high   = na
+var int   bar_last_high   = na
+
+var float price_prev_low  = na
+var float price_last_low  = na
+var int   bar_prev_low    = na
+var int   bar_last_low    = na
+
+// Per-oscillator value at the swing-high pivot bars (prev, last)
+// (array.new_float(size) defaults each element to na — exactly what we want)
+var float[] osc_prev_high = array.new_float(10)
+var float[] osc_last_high = array.new_float(10)
+// Per-oscillator value at the swing-low pivot bars (prev, last)
+var float[] osc_prev_low  = array.new_float(10)
+var float[] osc_last_low  = array.new_float(10)
+
+// Previous pivot's chosen class (for density bonus)
+//   high side: 0=none, 1=RTD, 2=HTD, 3=BCv
+//   low  side: 0=none, 1=RBD, 2=HBD, 3=BC
+var int prev_chosen_high_class = 0
+var int prev_chosen_low_class  = 0
+
+// Entry-bar tracker (for maxHoldBars)
+var int entry_bar = na
+// Cooldown trackers
+var int last_long_bar  = na
+var int last_short_bar = na
+
+// ===================================================================
+// 10. CAUSAL PIVOT DETECTION (NO REPAINT)
+// ===================================================================
+// At bar t, pivot bar = t-pivotRight. Condition ta.highestbars == -pivotRight
+// means: the highest high in the last L bars is exactly R bars ago.
+bool is_new_swing_high = ta.highestbars(high, pivotLeft) == -pivotRight
+bool is_new_swing_low  = ta.lowestbars(low,  pivotLeft)  == -pivotRight
+
+// ===================================================================
+// 11. PER-OSCILLATOR STATE UPDATE + VOTE TALLY (AT EACH NEW PIVOT)
+// ===================================================================
+// Class codes (per side):
+//   swing HIGH (bearish): 1=RTD, 2=HTD, 3=BCv, 0=none
+//   swing LOW  (bullish): 1=RBD, 2=HBD, 3=BC,  0=none
+
+// Vote counts (reset each bar; nonzero only when a pivot fires)
+int bull_rev_votes  = 0   // RBD votes (swing low)
+int bull_hid_votes  = 0   // HBD votes
+int bull_conv_votes = 0   // BC  votes
+int bear_rev_votes  = 0   // RTD votes (swing high)
+int bear_hid_votes  = 0   // HTD votes
+int bear_conv_votes = 0   // BCv votes
+
+// ---- Swing HIGH (bearish family) ----
+if is_new_swing_high and is_confirmed
+    // Shift price state (pivot bar = t-R)
+    price_prev_high := price_last_high
+    price_last_high := high[pivotRight]
+    bar_prev_high   := bar_last_high
+    bar_last_high   := bar_index - pivotRight
+    // ─── minPivotBars spacing filter (causal) ───
+    // فیلتر فاصله پیوت‌ها: اگر فاصله بین دو پیوت متوالی کمتر از حد باشد، کل ارزیابی نادیده گرفته می‌شود.
+    bool spacing_ok_high = na(bar_prev_high) ? true : (bar_last_high - bar_prev_high) >= minPivotBars
+    if spacing_ok_high
+        // Per-oscillator shift + classify against the previous pivot
+        for i = 0 to 9
+            if is_en(i)
+                float new_val  = array.get(cur_osc, i)
+                float old_last = array.get(osc_last_high, i)
+                array.set(osc_prev_high, i, old_last)
+                array.set(osc_last_high, i, new_val)
+                if not na(price_prev_high) and not na(old_last) and not na(new_val)
+                    // ─── minDivRatio magnitude filter (causal) ───
+                    // فیلتر قدرت واگرایی: اگر |osc_last − osc_prev| نسبت به محدوده اخیر اوسیلاتور
+                    // (پنجره magLookback منتهی به پیوت) کمتر از حد باشد، رأی سرکوب می‌شود.
+                    float osc_mag   = math.abs(new_val - old_last)
+                    float osc_hi    = array.get(cur_mag_hi, i)
+                    float osc_lo    = array.get(cur_mag_lo, i)
+                    float osc_range = (na(osc_hi) or na(osc_lo)) ? na : (osc_hi - osc_lo)
+                    bool mag_ok = na(osc_range) or osc_range <= 0 or osc_mag >= minDivRatio * osc_range
+                    if mag_ok
+                        if price_last_high > price_prev_high and new_val < old_last
+                            bear_rev_votes  := bear_rev_votes  + 1   // RTD
+                        else if price_last_high < price_prev_high and new_val > old_last
+                            bear_hid_votes  := bear_hid_votes  + 1   // HTD
+                        else if price_last_high < price_prev_high and new_val < old_last
+                            bear_conv_votes := bear_conv_votes + 1   // BCv
+
+// ---- Swing LOW (bullish family) ----
+if is_new_swing_low and is_confirmed
+    price_prev_low := price_last_low
+    price_last_low := low[pivotRight]
+    bar_prev_low   := bar_last_low
+    bar_last_low   := bar_index - pivotRight
+    // ─── minPivotBars spacing filter (causal) ───
+    // فیلتر فاصله پیوت‌ها: اگر فاصله بین دو پیوت متوالی کمتر از حد باشد، کل ارزیابی نادیده گرفته می‌شود.
+    bool spacing_ok_low = na(bar_prev_low) ? true : (bar_last_low - bar_prev_low) >= minPivotBars
+    if spacing_ok_low
+        // Per-oscillator shift + classify against the previous pivot
+        for i = 0 to 9
+            if is_en(i)
+                float new_val  = array.get(cur_osc, i)
+                float old_last = array.get(osc_last_low, i)
+                array.set(osc_prev_low, i, old_last)
+                array.set(osc_last_low, i, new_val)
+                if not na(price_prev_low) and not na(old_last) and not na(new_val)
+                    // ─── minDivRatio magnitude filter (causal) ───
+                    // فیلتر قدرت واگرایی: اگر |osc_last − osc_prev| نسبت به محدوده اخیر اوسیلاتور
+                    // (پنجره magLookback منتهی به پیوت) کمتر از حد باشد، رأی سرکوب می‌شود.
+                    float osc_mag  = math.abs(new_val - old_last)
+                    float osc_hi   = array.get(cur_mag_hi, i)
+                    float osc_lo   = array.get(cur_mag_lo, i)
+                    float osc_range = (na(osc_hi) or na(osc_lo)) ? na : (osc_hi - osc_lo)
+                    bool mag_ok = na(osc_range) or osc_range <= 0 or osc_mag >= minDivRatio * osc_range
+                    if mag_ok
+                        if price_last_low < price_prev_low and new_val > old_last
+                            bull_rev_votes  := bull_rev_votes  + 1   // RBD
+                        else if price_last_low > price_prev_low and new_val < old_last
+                            bull_hid_votes  := bull_hid_votes  + 1   // HBD
+                        else if price_last_low > price_prev_low and new_val > old_last
+                            bull_conv_votes := bull_conv_votes + 1   // BC
+
+// ===================================================================
+// 12. CONFLUENCE SCORING — PICK BEST CLASS PER SIDE
+// ===================================================================
+// Tie-break order:  reversal(1) > hidden(2) > convergence(3).
+// Density bonus added to strength if same class won the previous pivot.
+// Require minStrength (with bonus) AND minVotes.
+
+bool  sig_bull           = false
+int   bull_class         = 0
+float bull_best_strength = 0.0
+
+if is_new_swing_low and is_confirmed and totalEnabled > 0
+    int best       = 0
+    int best_votes = 0
+    if bull_rev_votes > 0 and bull_rev_votes >= bull_hid_votes and bull_rev_votes >= bull_conv_votes
+        best       := 1
+        best_votes := bull_rev_votes
+    else if bull_hid_votes > 0 and bull_hid_votes >= bull_conv_votes
+        best       := 2
+        best_votes := bull_hid_votes
+    else if bull_conv_votes > 0
+        best       := 3
+        best_votes := bull_conv_votes
+    float base_strength = best_votes > 0 ? float(best_votes) / float(totalEnabled) : 0.0
+    float strength      = base_strength
+    if best != 0 and prev_chosen_low_class == best
+        strength := strength + densityBonus
+    if best != 0 and best_votes >= minVotes and strength >= minStrength
+        sig_bull           := true
+        bull_class         := best
+        bull_best_strength := strength
+    // Update prev-chosen-class only when a class actually had votes
+    prev_chosen_low_class := best_votes > 0 ? best : 0
+
+bool  sig_bear           = false
+int   bear_class         = 0
+float bear_best_strength = 0.0
+
+if is_new_swing_high and is_confirmed and totalEnabled > 0
+    int best       = 0
+    int best_votes = 0
+    if bear_rev_votes > 0 and bear_rev_votes >= bear_hid_votes and bear_rev_votes >= bear_conv_votes
+        best       := 1
+        best_votes := bear_rev_votes
+    else if bear_hid_votes > 0 and bear_hid_votes >= bear_conv_votes
+        best       := 2
+        best_votes := bear_hid_votes
+    else if bear_conv_votes > 0
+        best       := 3
+        best_votes := bear_conv_votes
+    float base_strength = best_votes > 0 ? float(best_votes) / float(totalEnabled) : 0.0
+    float strength      = base_strength
+    if best != 0 and prev_chosen_high_class == best
+        strength := strength + densityBonus
+    if best != 0 and best_votes >= minVotes and strength >= minStrength
+        sig_bear           := true
+        bear_class         := best
+        bear_best_strength := strength
+    prev_chosen_high_class := best_votes > 0 ? best : 0
+
+// ===================================================================
+// 13. CONFIRMATIONS
+// ===================================================================
+// Candle pattern helpers (current bar = signal bar)
+_body        = math.abs(close - open)
+_lower_wick  = math.min(open, close) - low
+_upper_wick  = high - math.max(open, close)
+
+bool bull_engulf = close[1] < open[1] and close > open and close >= open[1] and open <= close[1]
+bool hammer      = close > open and _lower_wick > 2 * _body and _upper_wick < _body * 0.5
+bool bull_pat    = bull_engulf or hammer
+
+bool bear_engulf = close[1] > open[1] and close < open and close <= open[1] and open >= close[1]
+bool shoot_star  = close < open and _upper_wick > 2 * _body and _lower_wick < _body * 0.5
+bool bear_pat    = bear_engulf or shoot_star
+
+// Volume spike on signal bar (current closed bar)
+_avg_vol  = ta.sma(volume, 20)
+bool vol_spike = volume > volMult * _avg_vol
+
+// RSI value at pivot bar (read at [pivotRight])
+float rsi_at_pivot = osc0[pivotRight]
+
+// Trend filter (class-dependent):
+//   reversal(1)        => counter-trend  (LONG needs close<EMA, SHORT needs close>EMA)
+//   continuation(2/3)  => with-trend     (LONG needs close>EMA, SHORT needs close<EMA)
+bool trend_ok_long  = not useTrendFilter
+     or (bull_class == 1 and close < emaTrend)
+     or (bull_class != 1 and bull_class != 0 and close > emaTrend)
+
+bool trend_ok_short = not useTrendFilter
+     or (bear_class == 1 and close > emaTrend)
+     or (bear_class != 1 and bear_class != 0 and close < emaTrend)
+
+// RSI extreme (only for reversal class — RBD/RTD)
+bool rsi_ok_long  = not useRSIExtreme or bull_class != 1 or rsi_at_pivot < rsiBullMax
+bool rsi_ok_short = not useRSIExtreme or bear_class != 1 or rsi_at_pivot > rsiBearMin
+
+// Volume spike + candle confirm
+bool vol_ok_long     = not useVolumeSpike   or vol_spike
+bool vol_ok_short    = not useVolumeSpike   or vol_spike
+bool candle_ok_long  = not useCandleConfirm or bull_pat
+bool candle_ok_short = not useCandleConfirm or bear_pat
+
+// ===================================================================
+// 14. COOLDOWN + FINAL SIGNALS
+// ===================================================================
+bool cooldown_ok_long  = na(last_long_bar)  or cooldown == 0 or (bar_index - last_long_bar)  >= cooldown
+bool cooldown_ok_short = na(last_short_bar) or cooldown == 0 or (bar_index - last_short_bar) >= cooldown
+
+bool raw_long  = sig_bull and trend_ok_long  and rsi_ok_long  and vol_ok_long  and candle_ok_long  and bull_class != 0
+bool raw_short = sig_bear and trend_ok_short and rsi_ok_short and vol_ok_short and candle_ok_short and bear_class != 0
+
+bool sig_long  = raw_long  and is_confirmed and cooldown_ok_long
+bool sig_short = raw_short and is_confirmed and cooldown_ok_short
+
+if sig_long
+    last_long_bar := bar_index
+if sig_short
+    last_short_bar := bar_index
+
+// ===================================================================
+// 15. STRATEGY EXECUTION & RISK MANAGEMENT
+// ===================================================================
+// (a) Max-hold exit (closes any open position after maxHoldBars)
+if strategy.position_size != 0 and not na(entry_bar) and (bar_index - entry_bar) >= maxHoldBars
+    strategy.close_all(comment="MaxHold")
+
+// (b) New entries & opposite-signal exit / reversal
+if sig_long
+    if strategy.position_size < 0
+        if allowReversal
+            strategy.entry("Long", strategy.long, comment="RevLong")
+            entry_bar := bar_index
+        else
+            strategy.close("Short", comment="OppSignal")
+    else if strategy.position_size == 0
+        strategy.entry("Long", strategy.long, comment="Long")
+        entry_bar := bar_index
+
+if sig_short
+    if strategy.position_size > 0
+        if allowReversal
+            strategy.entry("Short", strategy.short, comment="RevShort")
+            entry_bar := bar_index
+        else
+            strategy.close("Long", comment="OppSignal")
+    else if strategy.position_size == 0
+        strategy.entry("Short", strategy.short, comment="Short")
+        entry_bar := bar_index
+
+// (c) SL / TP / Trailing via strategy.exit
+if strategy.position_size > 0
+    float sl        = strategy.position_avg_price - atrValue * slMult
+    float tp        = strategy.position_avg_price + atrValue * tpMult
+    float trail_act = strategy.position_avg_price + atrValue * trailMult
+    float trail_off = (atrValue * trailMult) / syminfo.mintick
+    strategy.exit("ExitLong", from_entry="Long",
+         stop=sl, limit=tp,
+         trail_price=useTrailing ? trail_act : na,
+         trail_offset=useTrailing ? trail_off : na)
+
+if strategy.position_size < 0
+    float sl        = strategy.position_avg_price + atrValue * slMult
+    float tp        = strategy.position_avg_price - atrValue * tpMult
+    float trail_act = strategy.position_avg_price - atrValue * trailMult
+    float trail_off = (atrValue * trailMult) / syminfo.mintick
+    strategy.exit("ExitShort", from_entry="Short",
+         stop=sl, limit=tp,
+         trail_price=useTrailing ? trail_act : na,
+         trail_offset=useTrailing ? trail_off : na)
+
+// ===================================================================
+// 16. VISUALIZATION
+// ===================================================================
+// LONG / SHORT labels (final, post-confirmations)
+plotshape(sig_long,  "LONG",  shape.labelup,   location.belowbar, color=color.green,  text="LONG",  textcolor=color.white, size=size.small)
+plotshape(sig_short, "SHORT", shape.labeldown, location.abovebar, color=color.red,    text="SHORT", textcolor=color.white, size=size.small)
+
+// Confirmed price pivots (offset to the actual pivot bar at t-R)
+plotshape(is_new_swing_high, "Swing High", shape.triangledown, location.abovebar, color=color.gray, size=size.tiny, offset=-pivotRight)
+plotshape(is_new_swing_low,  "Swing Low",  shape.triangleup,   location.belowbar, color=color.gray, size=size.tiny, offset=-pivotRight)
+
+// 6 signal types — color-coded diamonds (only when confluence thresholds met)
+plotshape(sig_bull and bull_class == 1, "RBD Reg Bull Div",  shape.diamond, location.belowbar, color=color.lime,    size=size.tiny)
+plotshape(sig_bull and bull_class == 2, "HBD Hid Bull Div",  shape.diamond, location.belowbar, color=color.aqua,    size=size.tiny)
+plotshape(sig_bull and bull_class == 3, "BC  Bull Conv",     shape.diamond, location.belowbar, color=color.teal,    size=size.tiny)
+plotshape(sig_bear and bear_class == 1, "RTD Reg Bear Div", shape.diamond, location.abovebar, color=color.red,     size=size.tiny)
+plotshape(sig_bear and bear_class == 2, "HTD Hid Bear Div", shape.diamond, location.abovebar, color=color.fuchsia, size=size.tiny)
+plotshape(sig_bear and bear_class == 3, "BCv Bear Conv",    shape.diamond, location.abovebar, color=color.orange,  size=size.tiny)
+
+// ===================================================================
+// 17. ALERTS  (strategy() uses alert() — alertcondition() is study-only)
+// ===================================================================
+if sig_long
+    alert("Oscillator Confluence LONG Signal", alert.freq_once_per_bar)
+if sig_short
+    alert("Oscillator Confluence SHORT Signal", alert.freq_once_per_bar)
+
+// Raw 6-class alerts — fires when at least one oscillator votes that class
+if is_new_swing_low  and bull_rev_votes  > 0
+    alert("Regular Bullish Divergence detected (RBD)", alert.freq_once_per_bar)
+if is_new_swing_low  and bull_hid_votes  > 0
+    alert("Hidden Bullish Divergence detected (HBD)", alert.freq_once_per_bar)
+if is_new_swing_low  and bull_conv_votes > 0
+    alert("Bullish Convergence detected (BC)", alert.freq_once_per_bar)
+if is_new_swing_high and bear_rev_votes  > 0
+    alert("Regular Bearish Divergence detected (RTD)", alert.freq_once_per_bar)
+if is_new_swing_high and bear_hid_votes  > 0
+    alert("Hidden Bearish Divergence detected (HTD)", alert.freq_once_per_bar)
+if is_new_swing_high and bear_conv_votes > 0
+    alert("Bearish Convergence detected (BCv)", alert.freq_once_per_bar)
